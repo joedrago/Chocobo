@@ -1,0 +1,169 @@
+"""Cut chocobo.wav (a Chocobo-theme medley) into per-game loopable Ogg files,
+and write Songs.lua (the addon's song manifest, since WoW can't list a folder).
+
+Usage:  python tools/make_music.py [chocobo.wav] [addon_dir]
+
+- Snaps each listed chapter boundary to the real seam (see snap()).
+- Trims leading/trailing near-silence, applies a short fade-in, a 3 s fade-out and
+  a short silent tail so the restart when the file loops is clean.
+- Measures EBU R128 loudness, applies gain to TARGET_LUFS and a brickwall limiter so
+  every variant plays at the same (game-music-competitive) level without clipping.
+- Encodes 44.1 kHz stereo Ogg Vorbis, which WoW's PlayMusic()/PlaySoundFile() accept.
+"""
+import array
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+SRC = sys.argv[1] if len(sys.argv) > 1 else "chocobo.wav"
+ADDON = sys.argv[2] if len(sys.argv) > 2 else "."
+OUT = os.path.join(ADDON, "music")
+
+# (start "m:ss", file stem, display name)
+CHAPTERS = [
+    ("0:00", "ff02_nes", "Final Fantasy II (NES)"),
+    ("0:22", "ff02_psp", "Final Fantasy II (PSP)"),
+    ("0:45", "ff03_nes", "Final Fantasy III (NES)"),
+    ("1:18", "ff03_ds", "Final Fantasy III (DS)"),
+    ("2:00", "ff04_snes", "Final Fantasy IV (SNES)"),
+    ("2:27", "ff04_gba", "Final Fantasy IV (GBA)"),
+    ("2:52", "ff04_ds", "Final Fantasy IV (DS)"),
+    ("3:19", "ff05_snes", "Final Fantasy V (SNES)"),
+    ("3:53", "ff05_gba", "Final Fantasy V (GBA)"),
+    ("4:28", "ff06_snes", "Final Fantasy VI (SNES)"),
+    ("5:06", "ff06_gba", "Final Fantasy VI (GBA)"),
+    ("5:45", "ff07_ps1", "Final Fantasy VII (PS1)"),
+    ("6:21", "ff08_ps1", "Final Fantasy VIII (PS1)"),
+    ("7:22", "ff09_ps1", "Final Fantasy IX (PS1)"),
+    ("8:16", "ff10_ps2", "Final Fantasy X (PS2)"),
+    ("9:28", "ff11_ps2", "Final Fantasy XI (PS2)"),
+    ("9:55", "ff12_ps2", "Final Fantasy XII (PS2)"),
+    ("10:52", "ff13_ps3", "Final Fantasy XIII (PS3)"),
+    ("12:06", "ff13-2_ps3", "Final Fantasy XIII-2 (PS3)"),
+    ("13:40", "ff14_pc", "Final Fantasy XIV (PC)"),
+    ("14:40", "ff15_ps4", "Final Fantasy XV (PS4)"),
+]
+
+AN_SR = 8000          # analysis sample rate
+WIN = AN_SR // 20     # 50 ms windows
+SNAP = 3.0            # silence-gap search radius around a listed boundary
+SNAP_BEFORE = 1.0     # otherwise search this far before ...
+SNAP_AFTER = 2.0      # ... and this far after the listed time
+SILENCE_DB = -50.0    # trim threshold for head/tail
+FADE_IN = 0.03
+FADE_OUT = 3.0
+TAIL_PAD = 0.5        # silence appended so the loop restart breathes
+TARGET_LUFS = -10.0   # WoW's own music is loud; -16 was buried under it
+LIMIT_DB = -2.0       # brickwall ceiling after the gain (Vorbis overshoots ~1 dB)
+VORBIS_Q = "5"        # ~145-160 kbps
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def secs(ts):
+    m, s = ts.split(":")
+    return int(m) * 60 + float(s)
+
+
+def envelope():
+    """Return per-50ms RMS in dBFS of a mono downmix."""
+    raw = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", SRC,
+         "-ac", "1", "-ar", str(AN_SR), "-f", "s16le", "-"],
+        check=True, capture_output=True).stdout
+    a = array.array("h")
+    a.frombytes(raw)
+    db = []
+    for i in range(len(a) // WIN):
+        chunk = a[i * WIN:(i + 1) * WIN]
+        rms = math.sqrt(sum(v * v for v in chunk) / WIN) / 32768
+        db.append(20 * math.log10(rms) if rms > 1e-6 else -120.0)
+    return db
+
+
+def snap(db, t):
+    """Snap a listed boundary to the actual seam. Verified against spectrograms:
+    the listed times are within ~1 s (usually rounded down), so take the quietest
+    150 ms in [t-1, t+2]; a true silence gap within +/-3 s always wins."""
+    n = len(db)
+    quiet = [i for i in range(max(0, int((t - SNAP) * 20)), min(n, int((t + SNAP) * 20)))
+             if db[i] < -70]
+    if quiet:
+        return quiet[len(quiet) // 2] / 20
+    lo, hi = max(1, int((t - SNAP_BEFORE) * 20)), min(n - 2, int((t + SNAP_AFTER) * 20))
+    return min(range(lo, hi), key=lambda i: db[i - 1] + db[i] + db[i + 1]) / 20
+
+
+def trim(db, start, end):
+    i, j = int(start * 20), int(end * 20) - 1
+    while i < j and db[i] < SILENCE_DB:
+        i += 1
+    while j > i and db[j] < SILENCE_DB:
+        j -= 1
+    return i / 20, (j + 1) / 20
+
+
+def loudnorm_measure(start, dur):
+    p = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
+         "-i", SRC, "-af",
+         "loudnorm=print_format=json",
+         "-f", "null", "-"], capture_output=True, text=True, check=True)
+    return json.loads(re.findall(r"\{[^{}]*\"input_i\"[^{}]*\}", p.stderr)[-1])
+
+
+def probe_duration(path):
+    return float(run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                      "-of", "csv=p=0", path]).stdout.strip())
+
+
+def write_manifest(songs):
+    lines = [
+        "-- Generated by tools/make_music.py -- do not edit by hand.",
+        "local _, ns = ...",
+        "ns.songs = {",
+    ]
+    for stem, title, length in songs:
+        lines.append(f'\t{{ file = "{stem}.ogg", name = "{title}", length = {length:.2f} }},')
+    lines.append("}")
+    with open(os.path.join(ADDON, "Songs.lua"), "w", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    db = envelope()
+    total = len(db) / 20
+
+    starts = [0.0] + [snap(db, secs(ts)) for ts, _, _ in CHAPTERS[1:]] + [total]
+    songs = []
+    for k, (ts, stem, title) in enumerate(CHAPTERS):
+        a, b = trim(db, starts[k], starts[k + 1])
+        dur = b - a
+        m = loudnorm_measure(a, dur)
+        af = ",".join([
+            f"afade=t=in:st=0:d={FADE_IN}",
+            f"afade=t=out:st={dur - FADE_OUT:.3f}:d={FADE_OUT}",
+            f"volume={TARGET_LUFS - float(m['input_i']):.2f}dB",
+            f"alimiter=limit={10 ** (LIMIT_DB / 20):.4f}:attack=5:release=80:level=0",
+            "aresample=44100",
+            f"apad=pad_dur={TAIL_PAD}",
+        ])
+        dst = os.path.join(OUT, stem + ".ogg")
+        run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-ss", f"{a:.3f}", "-t", f"{dur:.3f}", "-i", SRC,
+             "-af", af, "-ac", "2", "-c:a", "libvorbis", "-q:a", VORBIS_Q,
+             "-map_metadata", "-1", dst])
+        songs.append((stem, title, probe_duration(dst)))
+        print(f"{stem:12s} listed {ts:>5s}  cut {a:7.2f}-{b:7.2f}  ({dur:5.1f}s)"
+              f"  src {float(m['input_i']):6.1f} LUFS  -> {dst}")
+    write_manifest(songs)
+
+
+if __name__ == "__main__":
+    main()

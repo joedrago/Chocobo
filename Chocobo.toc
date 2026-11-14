@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: Chocobo
+## Notes: Plays a random Chocobo theme while you travel (mounts, travel forms, Ghost Wolf, Cheetah, flight paths).
+## Author: Joe Drago
+## Version: 1.0.0
+## SavedVariablesPerCharacter: ChocoboDB
+
+Songs.lua
+Chocobo.lua
